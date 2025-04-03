@@ -1,0 +1,350 @@
+using Random
+using Printf
+using CairoMakie
+using NetCDF  # For handling snapshot outputs
+using Oceananigans, NonlinearSolve
+using Oceananigans.Units: minute, minutes, hour
+
+# Constants
+ρw = 1030.0  # kg/m³ (water density)
+ρi = 917.0   # kg/m³ (ice density)
+Lf = 3.35e5  # J/kg (latent heat of melting)
+cp = 4.18e3  # J/kg/K (heat capacity of seawater)
+κT = 1.4e-7  # m²/s (thermal diffusivity)
+κS = 1.3e-9  # m²/s (salt diffusivity)
+f = -1.37e-4     # Coriolis parameter
+Cd = 2.4e-3  # Drag coefficient
+α = 3.8e-5   # Thermal expansion coefficient
+β = 7.8e-4   # Haline contraction coefficient
+g = 9.81     # Gravitational acceleration
+N0 = 1.6e-3  # Reference buoyancy frequency (s⁻¹)
+ν =2e-6   #molecular viscosity
+a, b = -0.057, -0.311  # Freezing point parameters
+# Case A2 Parameters
+U0 = 0.014   # m/s (1.4 cm/s)
+S0 = 34.5    # Initial far-field salinity (g/kg)
+T0star= 0.0025 # Initial thermal driving (T0star=T0-Tf(S0))
+T0 = T0star-0.057*S0-0.311    # Initial far-field temperature (°C)
+#ustar = sqrt(Cd) * U0
+
+Nx = Ny = 16     # number of points in each of horizontal directions
+Nz = 32          # number of points in the vertical direction
+
+Lx = Ly = 7.2     # (m) domain horizontal extents
+Lz = 7.2          # (m) domain depth
+
+refinement = 2 # controls spacing near surface (higher means finer spaced)
+stretching = 12  # controls rate of stretching at bottom
+
+# Normalized height ranging from 0 to 1
+h(k) = (k - 1) / Nz
+
+# Linear near-surface generator
+ζ₀(k) = 1 + (h(k) - 1) / refinement
+
+# Bottom-intensified stretching function
+Σ(k) = (1 - exp(-stretching * h(k))) / (1 - exp(-stretching))
+
+# Generating function
+z_faces(k) = Lz * (ζ₀(k) * Σ(k) - 1)
+
+grid = RectilinearGrid( size = (Nx, Nx, Nz),
+                          x = (0, Lx),
+                          y = (0, Ly),
+                          z = z_faces,
+                        topology = (Periodic, Periodic, Bounded))
+
+# Pressure gradient forcing to maintain geostrophic balance (check this one according to the info)
+dPdy = -f* U0 * ρw
+geostrophic_forcing_u(x, y, z, t) = -f* U0
+
+# sponge layer
+damping_rate=1/500
+bottom_mask = GaussianMask{:z}(center=-grid.Lz, width=grid.Lz/10)
+u_sponge = Relaxation(rate=damping_rate, mask=bottom_mask, target=U0)
+T_sponge = Relaxation(rate=damping_rate, mask=bottom_mask, target=T0)
+S_sponge = Relaxation(rate=damping_rate, mask=bottom_mask, target=S0)
+
+buoyancy = SeawaterBuoyancy(equation_of_state=LinearEquationOfState(thermal_expansion = α,
+                                                                    haline_contraction = β))
+
+no_slip_bc = ValueBoundaryCondition(0.0)
+velocity_bcs=FieldBoundaryConditions(top=no_slip_bc)
+
+Q = 20.0  # W m⁻², surface _heat_ flux
+
+Jᵀ = Q / (ρw * cp) # K m s⁻¹, surface _temperature_ flux
+T_bc = FieldBoundaryConditions(top = FluxBoundaryCondition(Jᵀ))
+
+@inline Jˢ(x, y, t, S, evaporation_rate) = evaporation_rate * S # [salinity unit] m s⁻¹
+evaporation_rate = 1e-4 / hour # m s⁻¹
+evaporation_bc = FluxBoundaryCondition(Jˢ, field_dependencies=:S, parameters=evaporation_rate)
+S_bc = FieldBoundaryConditions(top=evaporation_bc)
+
+# Model Setup
+model = NonhydrostaticModel(
+    grid = grid,
+    advection = UpwindBiased(order=5),
+    coriolis = FPlane(f=f),
+    tracers = (:T, :S),
+    buoyancy = buoyancy,
+    forcing=(u = (geostrophic_forcing_u, u_sponge), v= (geostrophic_forcing_u, u_sponge), T=T_sponge, S=S_sponge),
+    boundary_conditions = (; u=velocity_bcs, v=velocity_bcs, T=T_bc, S=S_bc),
+    closure = AnisotropicMinimumDissipation()
+)
+
+
+# Random noise damped at top and bottom
+Ξ(z) = randn() * z / grid.Lz * (1 + z / grid.Lz)  # Noise function
+
+# Vertical velocity profile with random noise
+Uᵢ(x, y, z) = U0 + 1e-3 * Ξ(z)  # Velocity profile with noise
+
+# Temperature initial condition: a stable density gradient with random noise superposed.
+Tᵢ(x, y, z) = T0 + 1e-6 * Ξ(z)  # Temperature profile with noise
+
+# Salinity initial condition: linear gradient with noise
+Sᵢ(x, y, z) = S0 - 4.0e-4 * z - 1e-6 * Ξ(z)  # Salinity profile with noise
+
+# Set initial conditions using `set!` function
+set!(model, u=Uᵢ, v=Uᵢ, T=Tᵢ, S=Sᵢ)
+
+simulation = Simulation(model, Δt=10.0, stop_time=120minutes)
+# Print a progress message
+progress_message(sim) = @printf("Iteration: %04d, time: %s, Δt: %s, max(|w|) = %.1e ms⁻¹, wall time: %s\n",
+                                iteration(sim), prettytime(sim), prettytime(sim.Δt),
+                                maximum(abs, sim.model.velocities.w), prettytime(sim.run_wall_time))
+
+add_callback!(simulation, progress_message, IterationInterval(20))
+
+# Define Stratification
+stratification = (; N²=g / ρw * (α * ∂z(model.tracers.T) - β * ∂z(model.tracers.S)))  # Stratification (Brunt-Väisälä frequency squared)
+
+#meltrate
+per_year=60*60*24*365
+melt = (;mₑ=-per_year*ρw * cp * κT * ∂z(model.tracers.T) / (ρi * Lf))
+
+
+# Define the filename for the output
+filename = "melting"
+
+# Set up the output writer for slices
+simulation.output_writers[:slices] =
+    JLD2OutputWriter(model, merge(model.velocities, model.tracers, melt, stratification),
+                     filename = filename * ".jld2",
+                     
+                     schedule = TimeInterval(1minute),
+                     overwrite_existing = true)
+run!(simulation)
+
+filepath = filename * ".jld2"
+
+time_series = (w = FieldTimeSeries(filepath, "w"),
+               T = FieldTimeSeries(filepath, "T"),
+               S = FieldTimeSeries(filepath, "S"),
+               melt= FieldTimeSeries(filepath, "mₑ"),
+               N²= FieldTimeSeries(filepath, "N²"))
+
+# Coordinate arrays
+xw, yw, zw = nodes(time_series.w)
+xT, yT, zT = nodes(time_series.T)
+
+times = time_series.w.times
+intro = searchsortedfirst(times, 5minutes)
+
+time_series = (u = FieldTimeSeries(filepath, "u"), 
+               w = FieldTimeSeries(filepath, "w"),
+               T = FieldTimeSeries(filepath, "T"),
+               S = FieldTimeSeries(filepath, "S"),
+               melt= FieldTimeSeries(filepath, "mₑ"),
+               N²= FieldTimeSeries(filepath, "N²"))
+
+# Time variables
+t = time_series.u.times
+Nt = length(t)
+
+# Define figure
+set_theme!(Theme(fontsize=20))
+fig = Figure(size = (1000, 500))
+
+# Slider for time control
+slider = Slider(fig[2, 1:3], range=1:Nt, startvalue=1)
+n = slider.value
+
+# --- Heatmap of velocity ---
+axis_kwargs = (xlabel="x", ylabel="z")
+axb = Axis(fig[1, 1]; title="Meltrate (m/yr)", axis_kwargs...)
+
+# Velocity heatmap at current time step
+A = @lift view(time_series.melt[$n], :, :, 2)
+hm_A = heatmap!(axb, A)
+Colorbar(fig[1, 2], hm_A; label="m/yr")
+
+# --- Velocity profile along z at (x=15, y=0) ---
+ax_line = Axis(fig[1,3]; 
+               title="Velocity at x=0, y=0",
+               xlabel="Velocity (m/s)",
+               ylabel="z (m)", limits = ((0, 0.03), nothing))
+
+# Velocity profile at x=15, y=0
+velocity_profile = @lift view(time_series.u[$n], 1, 1, :)
+
+# Plot velocity profile (z vs velocity)
+lines!(ax_line, velocity_profile, label="Velocity", color=:red)
+
+fig
+
+# Assuming `time_series` and `grid` are defined somewhere before this block.
+
+n = Observable(1)  # Observable index for time series data
+
+# Make sure interior is correctly wrapped with @lift
+wₙ = @lift interior(time_series.w[$n],  :, 1, :)
+Tₙ = @lift interior(time_series.T[$n],  :, 1, :)
+Sₙ = @lift interior(time_series.S[$n],  :, 1, :)
+meltₙ = @lift interior(time_series.melt[$n], :, :, 2)
+N²ₙ = @lift interior(time_series.N²[$n], :, 1, :)
+uₙ = @lift interior(time_series.u[$n],  :, 1, :)
+
+fig = Figure(size = (1000, 1400))
+
+axis_kwargs = (xlabel="x (m)",
+               ylabel="z (m)",
+               aspect = AxisAspect(grid.Lx/grid.Lz),
+               limits = ((0, grid.Lx), (-grid.Lz, 0)))
+
+xy_axis_kwargs = (xlabel="x (m)",
+                  ylabel="y (m)",
+                  aspect = AxisAspect(grid.Lx/grid.Ly),
+                  limits = ((0, grid.Lx), (0, grid.Ly)))
+
+ax_w = Axis(fig[2, 1]; title = "Vertical velocity", axis_kwargs...)
+ax_T = Axis(fig[2, 3]; title = "Temperature", axis_kwargs...)
+ax_S = Axis(fig[3, 1]; title = "Salinity", axis_kwargs...)
+ax_melt = Axis(fig[3, 3]; title = "Melt rate", xy_axis_kwargs...)
+ax_u = Axis(fig[4, 1]; title = "x velocity", axis_kwargs...)
+ax_N² = Axis(fig[4, 3]; title = "Stratification", axis_kwargs...)
+
+title = @lift @sprintf("t = %s", prettytime(times[$n]))
+
+#xb = xb ./ 1e3 # convert m -> km
+#yb = yb ./ 1e3 # convert m -> km
+
+# Heatmap plots with color range limits
+hm_w = heatmap!(ax_w, xw, zw, wₙ; colormap = :balance)
+Colorbar(fig[2, 2], hm_w; label = "m s⁻¹")
+
+hm_T = heatmap!(ax_T, xT, zT, Tₙ; colormap = :thermal)
+Colorbar(fig[2, 4], hm_T; label = "°C")
+
+hm_S = heatmap!(ax_S, xT, zT, Sₙ; colormap = :haline)
+Colorbar(fig[3, 2], hm_S; label = "g/kg")
+
+hm_melt = heatmap!(ax_melt, xT, yT, meltₙ; colormap = :thermal)
+Colorbar(fig[3, 4], hm_melt; label = "m/yr")
+
+hm_N² = heatmap!(ax_N², xw, zw, N²ₙ; colormap = :thermal)
+Colorbar(fig[4, 4], hm_N²; label = "s⁻²")
+
+hm_u = heatmap!(ax_u, xw, zw, uₙ; colormap = :balance)
+Colorbar(fig[4, 2], hm_u; label = "m s⁻¹")
+
+fig[1, 1:4] = Label(fig, title, fontsize=24, tellwidth=false)
+
+# --- Velocity profile along z at (x=0, y=0) ---
+ax_line = Axis(fig[5, 1]; 
+               title="x Velocity at x=0, y=0",
+               xlabel="Velocity (m/s)",
+               ylabel="z (m)", 
+               limits=((0, 0.014), nothing))
+
+# Velocity profile extraction
+velocity_profile = @lift view(time_series.u[$n], 1, 1, :)
+
+# Plot velocity profile
+lines!(ax_line, velocity_profile, label="Velocity", color=:red)
+
+fig
+
+frames = intro:length(times)
+
+@info "Making a motion picture of ocean wind mixing and convection..."
+
+record(fig, filename * "_2d.mp4", frames, framerate=8) do i
+    n[] = i
+end
+
+n = Observable(1)  # Observable index for time series data
+
+time_series = (u = FieldTimeSeries(filepath, "u"), 
+               w = FieldTimeSeries(filepath, "w"),
+               T = FieldTimeSeries(filepath, "T"),
+               S = FieldTimeSeries(filepath, "S"),
+               melt= FieldTimeSeries(filepath, "mₑ"),
+               N²= FieldTimeSeries(filepath, "N²"))
+
+times = time_series.w.times
+
+# Make sure interior is correctly wrapped with @lift
+wₙ = @lift interior(time_series.w[$n],  1, :, :)
+Tₙ = @lift interior(time_series.T[$n],  :, 1, :)
+Sₙ = @lift interior(time_series.S[$n],  :, 1, :)
+meltₙ = @lift interior(time_series.melt[$n], :, :, 2)
+N²ₙ = @lift interior(time_series.N²[$n], :, 1, :)
+uₙ = @lift interior(time_series.u[$n],  :, 1, :)
+
+# Coordinate arrays
+x, y, z = nodes(grid, (Center(), Center(), Center()))
+xb, yb, zb = nodes(time_series.w)
+
+Nx, Ny, Nz = size(grid)
+
+x_xz = repeat(x, 1, Nz)
+y_xz_north = y[end] * ones(Nx, Nz)
+z_xz = repeat(reshape(z, 1, Nz), Nx, 1)
+
+x_yz_east = x[end] * ones(Ny, Nz)
+y_yz = repeat(y, 1, Nz)
+z_yz = repeat(reshape(z, 1, Nz), grid.Ny, 1)
+
+x_xy = x
+y_xy = y
+z_xy_top = z[end] * ones(grid.Nx, grid.Ny)
+
+fig = Figure(size = (1000, 800))
+
+zonal_slice_displacement = 1
+
+ax = Axis3(fig[2, 1],
+           aspect=(1, 1, 0.8),
+           xlabel = "x (m)",
+           ylabel = "y (m)",
+           zlabel = "z (m)",
+           xlabeloffset = 30,
+           ylabeloffset = 30,
+           zlabeloffset = 30,
+           limits = ((x[1], zonal_slice_displacement * x[end]), (y[1], y[end]), (z[1], z[end])),
+           elevation = 0.4,
+           azimuth = 7.1,
+           xspinesvisible = false,
+           zgridvisible = false,
+           protrusions = 50,
+           perspectiveness = 0.4)
+
+surface!(ax, x_yz_east, y_yz, z_yz;  color = wₙ, colormap = :balance)
+surface!(ax, x_xz, y_xz_north, z_xz; color = Tₙ, colormap = :thermal)
+surface!(ax, x_xy, y_xy, z_xy_top;   color = meltₙ, colormap = :thermal)
+
+
+title = @lift @sprintf("t = %s", prettytime(times[$n]))
+fig[1, 1] = Label(fig, title; fontsize = 24, tellwidth = false, padding = (0, 0, -120, 0))
+
+fig
+
+frames = 1:length(times)
+
+@info "Making a motion picture of ocean wind mixing and convection..."
+
+record(fig, filename * "_3d.mp4", frames, framerate=8) do i
+    n[] = i
+end
